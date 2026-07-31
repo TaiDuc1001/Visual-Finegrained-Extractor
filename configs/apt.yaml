@@ -25,7 +25,7 @@ training:
 
 data:
   kshot: 4
-  seed: 1
+  seeds: [1, 10, 100, 1000, 10000]
   num_workers: 8
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]

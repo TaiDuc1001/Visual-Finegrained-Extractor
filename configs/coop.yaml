@@ -7,7 +7,7 @@ model:
   dataset_name: "CUB-200-2011"
 
 training:
-  epochs: 100
+  epochs: 20
   batch_size: 32
   learning_rate: 0.002
   weight_decay: 0.0005
@@ -19,7 +19,7 @@ training:
 
 data:
   kshot: 4
-  seed: 1
+  seeds: [1, 10, 100, 1000, 10000]
   num_workers: 4
   run_eda: false
   clip_mean: [0.48145466, 0.4578275, 0.40821073]

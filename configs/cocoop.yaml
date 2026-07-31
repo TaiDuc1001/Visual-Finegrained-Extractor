@@ -17,7 +17,7 @@ training:
 
 data:
   kshot: 1
-  seed: 1
+  seeds: [1, 10, 100, 1000, 10000]
   val_size: 0.7
   num_workers: 4
   run_eda: false

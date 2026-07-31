@@ -9,10 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-datasets
 run.sh
 *.txt
-models
 outputs
 to_delete
 *.pt
@@ -20,8 +18,8 @@ to_delete
 
 checkpoints
 
-*.sh
 # *.log
 kaggle_upload/
 
 .syk4y-temp/
+.agents

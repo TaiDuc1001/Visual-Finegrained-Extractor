@@ -1,10 +1,19 @@
+import os
+import sys
+import time
+
+_mplbackend = os.environ.get("MPLBACKEND", "")
+if _mplbackend.lower() == "module://matplotlib_inline.backend_inline":
+    os.environ["MPLBACKEND"] = "Agg"
+
 import matplotlib
 
 if matplotlib.get_backend().lower() != 'agg':
-    matplotlib.use('Agg')
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        pass
 
-import os
-import sys
 import cv2
 import csv
 import copy
@@ -12,6 +21,8 @@ import json
 import yaml
 import umap
 import torch
+import torch.nn.functional as F
+import math
 import random
 import hashlib
 import datetime
@@ -20,14 +31,69 @@ import numpy as np
 from clip import clip
 from PIL import Image
 import seaborn as sns
+from torchvision import transforms
 import multiprocessing as mp
 from collections import Counter
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from typing import Any, Dict, List, Optional, Sequence
 from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score, f1_score, precision_score, recall_score
+from torchvision.datasets import ImageFolder
 
-from logger import logger, setup_logging # type: ignore
+import types
+import importlib.util
+import importlib.machinery
+import logging
+
+if importlib.util.find_spec("pkg_resources") is None:
+    import packaging
+    pkg_resources = types.ModuleType("pkg_resources")
+    pkg_resources.packaging = packaging
+    sys.modules["pkg_resources"] = pkg_resources
+
+_logger = logging.getLogger("apt")
+_logger.setLevel(logging.DEBUG)
+
+def _setup_logging_func(debug: bool = False, no_color: bool = False) -> None:
+    _logger.handlers = []
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    formatter = logging.Formatter(
+        fmt="[%(asctime)s] %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    _logger.addHandler(handler)
+
+_logger.success = lambda *a, **kw: None
+_logger.header = lambda *a, **kw: None
+_logger.section = lambda *a, **kw: None
+_logger.subsection = lambda *a, **kw: None
+_logger.divider = lambda *a, **kw: None
+_logger.metrics = lambda *a, **kw: None
+_logger.config_table = lambda *a, **kw: None
+_logger.epoch_summary = lambda *a, **kw: None
+_logger.model_summary = lambda *a, **kw: None
+_logger.training_start = lambda *a, **kw: None
+_logger.training_end = lambda *a, **kw: None
+_logger.checkpoint_saved = lambda *a, **kw: None
+_logger.step = lambda *a, **kw: None
+_logger.step_done = lambda *a, **kw: None
+_logger.comparison_table = lambda *a, **kw: None
+
+class _DummyProgress:
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+_logger.progress_context = lambda *a, **kw: _DummyProgress()
+
+_logger_module = types.ModuleType("logger")
+_logger_module.__spec__ = importlib.machinery.ModuleSpec("logger", None)
+_logger_module.logger = _logger
+_logger_module.setup_logging = _setup_logging_func
+sys.modules["logger"] = _logger_module
+
+logger = _logger
+setup_logging = _setup_logging_func
 
 
 class CheckpointCache:
@@ -211,10 +277,13 @@ def get_config_value(config, path, default=None):
     return current
 
 
-def merge_configs(base, override):
+def merge_configs(base, override, path=""):
     for key, value in override.items():
+        full_key = f"{path}.{key}" if path else key
+        if key not in base and full_key != "data.all":
+            raise KeyError(f"Configuration key '{full_key}' does not exist in the base configuration.")
         if isinstance(value, dict) and isinstance(base.get(key), dict):
-            merge_configs(base[key], value)
+            merge_configs(base[key], value, full_key)
         else:
             base[key] = value
     return base
@@ -268,6 +337,46 @@ def coerce_to_float(value, default, key=None):
         except ValueError as exc:
             raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.") from exc
     raise ValueError(f"Configuration value for {key or 'unknown'} must be a float.")
+
+
+def normalize_device_spec(value, default="cuda:0", key=None):
+    raw_device = coerce_to_str(value, default, key=key).strip()
+    if not raw_device:
+        raw_device = str(default)
+    lowered = raw_device.lower()
+
+    if lowered in {"cuda", "gpu"}:
+        return "cuda:0"
+    if lowered.isdigit():
+        return f"cuda:{int(lowered)}"
+    if lowered.startswith("gpu:"):
+        gpu_idx = lowered.split(":", 1)[1].strip()
+        if gpu_idx.isdigit():
+            return f"cuda:{int(gpu_idx)}"
+    if lowered.startswith("cuda:"):
+        cuda_idx = lowered.split(":", 1)[1].strip()
+        if cuda_idx.isdigit():
+            return f"cuda:{int(cuda_idx)}"
+    return lowered
+
+
+def resolve_torch_device(value, default="cuda:0", key=None):
+    normalized = normalize_device_spec(value, default=default, key=key)
+    requested_cuda = normalized.startswith("cuda")
+    if requested_cuda and not torch.cuda.is_available():
+        if value is not None:
+            logger.warning(
+                f"CUDA device '{normalized}' requested for {key or 'device'} "
+                "but CUDA is unavailable; falling back to CPU."
+            )
+        normalized = "cpu"
+    try:
+        return torch.device(normalized)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(
+            f"Invalid device value for {key or 'device'}: {value!r}. "
+            "Use 'cpu', 'cuda', 'cuda:N', or numeric GPU index like 0."
+        ) from exc
 
 
 def create_argument_parser(description, arg_schema):
@@ -1014,24 +1123,1234 @@ def compute_metrics(true_labels: Sequence[int], predictions: Sequence[int]) -> D
 
 
 def log_experiment_metrics(metrics: Dict[str, float]) -> None:
-    logger.info(f"{'='*60}")
-    logger.info("Evaluation Metrics:")
-    logger.info(f"  Accuracy:          {metrics.get('accuracy', 0.0):.2f}%")
-    logger.info(f"  MCA:               {metrics.get('mca', 0.0):.2f}%")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  F1 (Macro):        {metrics.get('f1_macro', 0.0):.4f}")
-    logger.info(f"  F1 (Micro):        {metrics.get('f1_micro', 0.0):.4f}")
-    logger.info(f"  F1 (Weighted):     {metrics.get('f1_weighted', 0.0):.4f}")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  Precision (Macro): {metrics.get('precision_macro', 0.0):.4f}")
-    logger.info(f"  Precision (Micro): {metrics.get('precision_micro', 0.0):.4f}")
-    logger.info(f"  Precision (Weighted): {metrics.get('precision_weighted', 0.0):.4f}")
-    logger.info(f"{'-'*30}")
-    logger.info(f"  Recall (Macro):    {metrics.get('recall_macro', 0.0):.4f}")
-    logger.info(f"  Recall (Micro):    {metrics.get('recall_micro', 0.0):.4f}")
-    logger.info(f"  Recall (Weighted): {metrics.get('recall_weighted', 0.0):.4f}")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'='*40}")
+    logger.info("Evaluation Results:")
+    logger.info(f"  Accuracy: {metrics.get('accuracy', 0.0):.2f}%")
+    if 'time' in metrics:
+        logger.info(f"  Time:     {metrics.get('time', 0.0):.1f}s")
+    logger.info(f"{'='*40}")
 
 
 def log_experiment_accuracy(accuracy: float) -> None:
     log_experiment_metrics({'accuracy': accuracy})
+
+
+DEFAULT_ARG_SCHEMA = {
+    'config': {'type': str, 'required': True, 'help': 'Path to YAML configuration file'},
+    'output_dir': {'type': str, 'help': 'Override logging.output_dir from config', 'config_path': 'logging.output_dir'},
+    'debug': {'type': bool, 'help': 'Enable debug logging', 'default': True},
+    'disable_coloring': {'type': bool, 'help': 'Disable colored output for log files', 'default': False},
+}
+
+
+def format_params(num):
+    if num >= 1e9:
+        return f"{num/1e9:.2f}B"
+    elif num >= 1e6:
+        return f"{num/1e6:.2f}M"
+    elif num >= 1e3:
+        return f"{num/1e3:.2f}K"
+    else:
+        return str(num)
+
+
+# --- Unified Protofuse-style Utilities for CLI Overrides, data.all, Seeds, and Caching ---
+
+DATA_ROOT_ENV_SUFFIX = "_DATA_ROOT"
+DATASET_NAME_OVERRIDES = {
+    "FGVC-Aircraft": "FGVCAircraft",
+}
+
+
+def derive_dataset_name_from_root(dataset_root):
+    dataset_name = os.path.basename(os.path.normpath(str(dataset_root)))
+    if not dataset_name:
+        raise ValueError(f"Cannot derive dataset name from empty root: {dataset_root!r}")
+    return DATASET_NAME_OVERRIDES.get(dataset_name, dataset_name)
+
+
+def discover_dataset_envs(environ=None):
+    source = os.environ if environ is None else environ
+    datasets = []
+    for env_key in sorted(source):
+        if not env_key.endswith(DATA_ROOT_ENV_SUFFIX):
+            continue
+        dataset_root = source[env_key]
+        if not dataset_root:
+            continue
+        datasets.append(
+            {
+                "env_key": env_key,
+                "root": dataset_root,
+                "dataset_name": derive_dataset_name_from_root(dataset_root),
+            }
+        )
+    return datasets
+
+
+def data_all_enabled(config):
+    return coerce_to_bool(get_config_value(config, "data.all", False), False, key="data.all")
+
+
+def coerce_to_bool(value, default=False, key=None):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "y", "on"):
+            return True
+        if lowered in ("0", "false", "no", "n", "off"):
+            return False
+    raise ValueError(f"Configuration value for {key or 'unknown'} must be boolean.")
+
+
+def announce_detected_datasets(datasets):
+    message = "Detected datasets: " + ", ".join(
+        f"{dataset['dataset_name']} ({dataset['env_key']})" for dataset in datasets
+    )
+    logger.info(message)
+
+
+def iter_dataset_configs(config, environ=None):
+    if not data_all_enabled(config):
+        yield config, None
+        return
+
+    datasets = discover_dataset_envs(environ)
+    if not datasets:
+        raise RuntimeError("No environment variables ending with _DATA_ROOT were found for data.all=True.")
+
+    announce_detected_datasets(datasets)
+
+    for dataset in datasets:
+        dataset_config = copy.deepcopy(config)
+        data_cfg = dataset_config.setdefault("data", {})
+        data_cfg["root"] = dataset["root"]
+        data_cfg["dataset_name"] = dataset["dataset_name"]
+        yield dataset_config, dataset
+
+
+def run_for_dataset_configs(config, runner, environ=None):
+    results = []
+    for dataset_config, dataset in iter_dataset_configs(config, environ=environ):
+        if dataset is not None:
+            logger.info(
+                "Running dataset %s from %s=%s",
+                dataset["dataset_name"],
+                dataset["env_key"],
+                dataset["root"],
+            )
+        results.append(runner(dataset_config, dataset))
+    return results
+
+
+def _scan_class_dir(args):
+    class_dir, class_idx, extensions, is_valid_file = args
+    class_samples = []
+    for root, _, files in os.walk(class_dir):
+        for file in sorted(files):
+            path = os.path.join(root, file)
+            if is_valid_file is not None:
+                if is_valid_file(path):
+                    class_samples.append((path, class_idx))
+            elif extensions is not None:
+                if path.lower().endswith(extensions):
+                    class_samples.append((path, class_idx))
+    return class_samples
+
+
+class CachedImageFolder(ImageFolder):
+    def __init__(
+        self,
+        root: str,
+        transform = None,
+        target_transform = None,
+        loader = None,
+        is_valid_file = None,
+        cache_dir: Optional[str] = None,
+        enabled: bool = True,
+    ):
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/protofuse/imagefolder")
+        self.cache_enabled = enabled
+        
+        kwargs = {}
+        if loader is not None:
+            kwargs['loader'] = loader
+        if is_valid_file is not None:
+            kwargs['is_valid_file'] = is_valid_file
+            
+        super().__init__(
+            root,
+            transform=transform,
+            target_transform=target_transform,
+            **kwargs
+        )
+
+    @staticmethod
+    def make_dataset(*args, **kwargs):
+        self_obj = None
+        if len(args) > 0 and isinstance(args[0], CachedImageFolder):
+            self_obj = args[0]
+            remaining_args = args[1:]
+        else:
+            remaining_args = args
+
+        directory = remaining_args[0] if len(remaining_args) > 0 else kwargs.get('directory')
+        class_to_idx = remaining_args[1] if len(remaining_args) > 1 else kwargs.get('class_to_idx')
+        extensions = remaining_args[2] if len(remaining_args) > 2 else kwargs.get('extensions')
+        is_valid_file = remaining_args[3] if len(remaining_args) > 3 else kwargs.get('is_valid_file')
+
+        cache_enabled = True
+        cache_dir = os.path.expanduser("~/.cache/protofuse/imagefolder")
+        if self_obj is not None:
+            cache_enabled = getattr(self_obj, 'cache_enabled', True)
+            cache_dir = getattr(self_obj, 'cache_dir', cache_dir)
+
+        cache_file_path = None
+        if cache_enabled:
+            try:
+                subdirs = []
+                for class_name in sorted(class_to_idx.keys()):
+                    class_dir = os.path.join(directory, class_name)
+                    if os.path.isdir(class_dir):
+                        mtime = os.path.getmtime(class_dir)
+                        subdirs.append(f"{class_name}:{mtime}")
+
+                sig_parts = [
+                    str(directory),
+                    json.dumps(subdirs),
+                    json.dumps(list(extensions) if extensions else []),
+                    str(is_valid_file)
+                ]
+                sig_str = "|".join(sig_parts)
+                cache_key = hashlib.md5(sig_str.encode()).hexdigest()
+
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_file_path = os.path.join(cache_dir, f"{cache_key}.json")
+
+                if os.path.exists(cache_file_path):
+                    with open(cache_file_path, "r") as f:
+                        cache_data = json.load(f)
+                    if isinstance(cache_data, dict) and "samples" in cache_data:
+                        samples = [tuple(item) for item in cache_data["samples"]]
+                        logger.info(f"[ImageFolder cache] hit ← loaded {len(samples)} samples from cache ({cache_key})")
+                        return samples
+            except Exception as e:
+                logger.warning(f"[ImageFolder cache] error reading cache: {e}")
+
+        logger.info(f"[ImageFolder cache] miss/disabled → scanning directory {directory} in parallel...")
+        start_time = time.perf_counter()
+
+        tasks = []
+        for class_name in sorted(class_to_idx.keys()):
+            class_dir = os.path.join(directory, class_name)
+            if os.path.isdir(class_dir):
+                class_idx = class_to_idx[class_name]
+                tasks.append((class_dir, class_idx, extensions, is_valid_file))
+
+        samples = []
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(32, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = executor.map(_scan_class_dir, tasks)
+            for res in results:
+                samples.extend(res)
+
+        samples.sort(key=lambda x: x[0])
+
+        duration = time.perf_counter() - start_time
+        logger.info(f"[ImageFolder cache] scanned {len(samples)} samples in {duration:.4f}s")
+
+        if cache_enabled and cache_file_path is not None:
+            try:
+                cache_data = {
+                    "version": 1,
+                    "root": directory,
+                    "classes": sorted(class_to_idx.keys()),
+                    "class_to_idx": class_to_idx,
+                    "samples": samples
+                }
+                temp_path = f"{cache_file_path}.tmp"
+                with open(temp_path, "w") as f:
+                    json.dump(cache_data, f)
+                os.replace(temp_path, cache_file_path)
+                logger.info(f"[ImageFolder cache] saved scanned samples to {cache_file_path}")
+            except Exception as e:
+                logger.warning(f"[ImageFolder cache] error writing cache: {e}")
+
+        return samples
+
+
+def fast_image_folder(root: str, transform=None, cache_dir: Optional[str] = None, enabled: bool = True, **kwargs):
+    return CachedImageFolder(root, transform=transform, cache_dir=cache_dir, enabled=enabled, **kwargs)
+
+
+class CLIPFeatureCache:
+    DEFAULT_CACHE_DIR = "checkpoints/clip_features"
+
+    def __init__(self, cache_dir: str = DEFAULT_CACHE_DIR, enabled: bool = True):
+        self.cache_dir = cache_dir
+        self.enabled = enabled
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _dataset_signature(self, dataset, classnames, template, backbone,
+                           precision, clip_mean, clip_std, transform_spec):
+        paths = [path for path, _ in dataset.samples]
+        labels = [int(label) for _, label in dataset.samples]
+        prompts = [template.format(c.replace("_", " ")) for c in classnames]
+        return {
+            "backbone": backbone,
+            "precision": precision,
+            "prompts": prompts,
+            "paths": paths,
+            "labels": labels,
+            "clip_mean": list(clip_mean),
+            "clip_std": list(clip_std),
+            "transform_spec": transform_spec,
+        }
+
+    def compute_cache_key(self, dataset, classnames, template, backbone,
+                          precision, clip_mean, clip_std, transform_spec):
+        signature = self._dataset_signature(
+            dataset, classnames, template, backbone,
+            precision, clip_mean, clip_std, transform_spec
+        )
+        key_str = json.dumps(signature, sort_keys=True)
+        return hashlib.md5(key_str.encode()).hexdigest()[:16], signature
+
+    def _cache_path(self, cache_key):
+        return os.path.join(self.cache_dir, f"{cache_key}.pt")
+
+    def load_or_compute(self, dataset, dataset_id, clip_model, classnames, template,
+                        backbone, precision, batch_size, num_workers, device,
+                        clip_mean, clip_std, transform_spec):
+        cache_key, signature = self.compute_cache_key(
+            dataset, classnames, template, backbone,
+            precision, clip_mean, clip_std, transform_spec
+        )
+        path = self._cache_path(cache_key)
+        if self.enabled and os.path.exists(path):
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            logger.info(f"Loaded CLIP feature cache ({dataset_id}) from {path}")
+            return payload
+
+        if self.enabled:
+            logger.info(f"Computing CLIP feature cache ({dataset_id}); cache miss at {path}")
+        else:
+            logger.info(f"Computing CLIP feature cache ({dataset_id}); cache disabled")
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        image_features = []
+        labels = []
+        clip_model.eval()
+        import torch.nn.functional as F
+        with torch.no_grad():
+            for images, batch_labels in loader:
+                images = images.to(device)
+                feats = clip_model.encode_image(images).float()
+                feats = F.normalize(feats, dim=-1)
+                image_features.append(feats.cpu())
+                labels.append(batch_labels.cpu().long())
+
+            prompts = signature["prompts"]
+            tokens = clip.tokenize(prompts).to(device)
+            text_features = clip_model.encode_text(tokens).float()
+            text_features = F.normalize(text_features, dim=-1).cpu()
+
+        payload = {
+            "image_features": torch.cat(image_features, dim=0).float(),
+            "labels": torch.cat(labels, dim=0).long(),
+            "paths": signature["paths"],
+            "text_features": text_features.float(),
+            "prompts": signature["prompts"],
+            "classnames": list(classnames),
+            "metadata": signature,
+            "cache_key": cache_key,
+        }
+
+        if self.enabled:
+            tmp_path = f"{path}.tmp"
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+            logger.info(f"Saved CLIP feature cache ({dataset_id}) to {path}")
+        return payload
+
+
+class BaseTrainer:
+    DEFAULT_LR = 0.002
+    DEFAULT_TRAINING_EPOCHS = 100
+
+    def __init__(self, cfg, classnames, device="cuda"):
+        if not isinstance(cfg, ConfigNode):
+            cfg = ConfigNode(cfg)
+        self.cfg = cfg
+        self.training_cfg = self.cfg.get('training', ConfigNode())
+        self.model_cfg = self.cfg.get('model', ConfigNode())
+        self.data_cfg = self.cfg.get('data', ConfigNode())
+        self.classnames = classnames
+        self.device = resolve_torch_device(device, default="cuda:0", key="device")
+
+        self.build_model()
+        self.setup_optimizer()
+        precision_mode = self._cfg_str('fp32', 'training.precision', 'precision')
+        self.scaler = torch.cuda.amp.GradScaler() if precision_mode == 'amp' else None
+
+    def _cfg_value(self, *paths, default=None):
+        sentinel = object()
+        for path in paths:
+            value = get_config_value(self.cfg, path, sentinel)
+            if value is not sentinel:
+                return value
+        return default
+
+    def _cfg_float(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_float(value, default)
+
+    def _cfg_int(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_int(value, default)
+
+    def _cfg_str(self, default, *paths):
+        value = self._cfg_value(*paths, default=default)
+        return coerce_to_str(value, default)
+
+    def build_model(self):
+        raise NotImplementedError
+
+    def setup_optimizer(self):
+        lr = self._cfg_float(self.DEFAULT_LR, 'training.learning_rate')
+        weight_decay = self._cfg_float(0.0005, 'training.weight_decay')
+        optimizer_type = self._cfg_str('SGD', 'training.optimizer')
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+        if optimizer_type == 'AdamW':
+            self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+        elif optimizer_type == 'Adam':
+            self.optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
+        else:
+            self.optimizer = torch.optim.SGD(trainable_params, lr=lr, weight_decay=weight_decay, momentum=0.9)
+
+        num_epochs = self._cfg_int(self.DEFAULT_TRAINING_EPOCHS, 'training.epochs')
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
+
+    def reset_optimizer_scheduler(self):
+        self.setup_optimizer()
+
+    def reset_model(self):
+        if hasattr(self, 'initial_model_state'):
+            self.model.load_state_dict(self.initial_model_state)
+            self.model.to(self.device)
+
+    def train_step(self, batch):
+        images, labels = batch
+        images = images.to(self.device)
+        labels = labels.to(self.device)
+
+        self.model.train()
+
+        precision = self._cfg_str('fp32', 'training.precision', 'precision')
+
+        if precision == 'amp':
+            with torch.cuda.amp.autocast():
+                logits = self.model(images)
+                loss = F.cross_entropy(logits, labels)
+            self.optimizer.zero_grad()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
+        else:
+            logits = self.model(images)
+            loss = F.cross_entropy(logits, labels)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        _, predicted = torch.max(logits.data, 1)
+        correct = (predicted == labels).sum().item()
+        total = labels.size(0)
+        accuracy = 100 * correct / total
+
+        return {"loss": loss.item(), "accuracy": accuracy}
+
+    def evaluate(self, dataloader):
+        self.model.eval()
+        correct = 0
+        total = 0
+        running_loss = 0.0
+        steps = 0
+        all_preds = []
+        all_labels_list = []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                logits = self.model(images)
+                loss = F.cross_entropy(logits, labels)
+                running_loss += loss.item()
+                steps += 1
+
+                _, predicted = torch.max(logits.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels_list.extend(labels.cpu().numpy())
+
+        metrics = compute_metrics(all_labels_list, all_preds)
+        avg_loss = running_loss / max(1, steps)
+        metrics['loss'] = avg_loss
+        metrics['predictions'] = all_preds
+        metrics['true_labels'] = all_labels_list
+        return metrics
+
+    def save_model(self, path):
+        if hasattr(self.model, "prompt_learner"):
+            model_payload = {'prompt_learner_state_dict': self.model.prompt_learner.state_dict()}
+        else:
+            model_payload = {'model_state_dict': self.model.state_dict()}
+        checkpoint = {
+            **model_payload,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
+            'cfg': self.cfg
+        }
+        torch.save(checkpoint, path)
+        logger.info(f"Model saved to {path}")
+
+    def load_model(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        if 'prompt_learner_state_dict' in checkpoint and hasattr(self.model, "prompt_learner"):
+            state_dict = checkpoint['prompt_learner_state_dict']
+            if "token_prefix" in state_dict:
+                del state_dict["token_prefix"]
+            if "token_suffix" in state_dict:
+                del state_dict["token_suffix"]
+            self.model.prompt_learner.load_state_dict(state_dict, strict=False)
+        elif 'model_state_dict' in checkpoint:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            raise KeyError("Checkpoint missing supported model payload.")
+
+    def get_checkpoint_state(self):
+        if hasattr(self.model, "prompt_learner") and hasattr(self.model.prompt_learner, "ctx"):
+            return {"kind": "prompt_ctx", "ctx": self.model.prompt_learner.ctx.detach().cpu()}
+        if hasattr(self.model, "adapter"):
+            return {"kind": "adapter", "adapter_state_dict": self.model.adapter.state_dict()}
+        return {"kind": "model", "model_state_dict": self.model.state_dict()}
+
+    def load_checkpoint_state(self, model_state) -> bool:
+        if not isinstance(model_state, dict):
+            logger.warning("Invalid checkpoint model_state type: %s", type(model_state).__name__)
+            return False
+
+        if "ctx" in model_state:
+            if hasattr(self.model, "prompt_learner") and hasattr(self.model.prompt_learner, "ctx"):
+                self.model.prompt_learner.ctx.data = model_state["ctx"].to(
+                    device=self.model.prompt_learner.ctx.device,
+                    dtype=self.model.prompt_learner.ctx.dtype,
+                )
+                return True
+            logger.warning("Checkpoint has ctx but current model has no prompt_learner.ctx")
+            return False
+
+        kind = str(model_state.get("kind", "")).lower()
+        if kind == "prompt_ctx":
+            if hasattr(self.model, "prompt_learner") and hasattr(self.model.prompt_learner, "ctx") and "ctx" in model_state:
+                self.model.prompt_learner.ctx.data = model_state["ctx"].to(
+                    device=self.model.prompt_learner.ctx.device,
+                    dtype=self.model.prompt_learner.ctx.dtype,
+                )
+                return True
+            logger.warning("Checkpoint kind=prompt_ctx incompatible with current model")
+            return False
+
+        if kind == "adapter" or "adapter_state_dict" in model_state:
+            if hasattr(self.model, "adapter") and "adapter_state_dict" in model_state:
+                self.model.adapter.load_state_dict(model_state["adapter_state_dict"], strict=False)
+                return True
+            logger.warning("Checkpoint contains adapter state but current model has no adapter")
+            return False
+
+        if kind == "model" and "model_state_dict" in model_state:
+            self.model.load_state_dict(model_state["model_state_dict"], strict=False)
+            return True
+
+        if "model_state_dict" in model_state:
+            self.model.load_state_dict(model_state["model_state_dict"], strict=False)
+            return True
+
+        logger.warning("Unsupported checkpoint model_state keys: %s", list(model_state.keys()))
+        return False
+
+
+class BaseTrainingPipeline:
+    METHOD_NAME = "Base"
+    DEFAULT_OUTPUT_DIR = "outputs/base"
+    DEFAULT_CHECKPOINT_DIR = "checkpoints/base"
+    TRAINER_CLASS = None
+    SAVE_BEST_LAST = True
+    _EXTRA_PIPELINE_CLASSES = []
+
+    @classmethod
+    def _all_subclasses(cls):
+        result = []
+        for sub in cls.__subclasses__():
+            result.append(sub)
+            result.extend(sub._all_subclasses())
+        return result
+
+    @classmethod
+    def register_extra_pipeline(cls, pipeline_cls):
+        if pipeline_cls not in cls._EXTRA_PIPELINE_CLASSES:
+            cls._EXTRA_PIPELINE_CLASSES.append(pipeline_cls)
+
+    @classmethod
+    def get_pipeline_by_name(cls, name):
+        name_lower = name.lower()
+        for sub in cls._all_subclasses():
+            if getattr(sub, 'METHOD_NAME', '').lower() == name_lower:
+                return sub
+        for sub in cls._EXTRA_PIPELINE_CLASSES:
+            if getattr(sub, 'METHOD_NAME', '').lower() == name_lower:
+                return sub
+            for child in sub.__subclasses__():
+                if getattr(child, 'METHOD_NAME', '').lower() == name_lower:
+                    return child
+        available = [getattr(s, 'METHOD_NAME', '?') for s in cls._all_subclasses() + cls._EXTRA_PIPELINE_CLASSES]
+        raise ValueError(f"No pipeline with METHOD_NAME='{name}'. Available: {available}")
+
+    def __init__(self, config):
+        if not isinstance(config, ConfigNode):
+            config = ConfigNode(config)
+        self.config = config
+        self.model_cfg = self.config.get('model', ConfigNode())
+        self.training_cfg = self.config.get('training', ConfigNode())
+        self.data_cfg = self.config.get('data', ConfigNode())
+        self.logging_cfg = self.config.get('logging', ConfigNode())
+        self.feature_cache_cfg = self.config.get('feature_cache', ConfigNode())
+        
+        save_best_last_value = get_config_value(self.training_cfg, "save_best_last", self.SAVE_BEST_LAST)
+        self.save_best_last = bool(self.SAVE_BEST_LAST if save_best_last_value is None else save_best_last_value)
+
+        device_value = self.training_cfg.get("device", None)
+        self.device = resolve_torch_device(device_value, default="cuda:0", key="training.device")
+
+        batch_value = self.training_cfg.get("batch_size", None)
+        self.batch_size = coerce_to_int(batch_value, 32, key="training.batch_size")
+
+        workers_value = self.data_cfg.get("num_workers", None)
+        self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
+
+        val_value = self.data_cfg.get("val_size", None)
+        if val_value is not None:
+            self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
+            if self.val_fraction > 1.0:
+                self.val_fraction = self.val_fraction / 100.0
+            if self.val_fraction < 0 or self.val_fraction >= 1.0:
+                raise ValueError("data.val_size must be in [0, 1) or 0-100 range when expressed as percentage.")
+        else:
+            self.val_fraction = None
+
+        dataset_root_value = self.data_cfg.get("root", "./datasets/cub-200-2011-renamed")
+        self.dataset_root = coerce_to_str(dataset_root_value, "./datasets/cub-200-2011-renamed", key="data.root")
+
+        seed_value = self.data_cfg.get("seed", None)
+        self.seed = coerce_to_int(seed_value, 42, key="data.seed")
+
+        kshot_value = self.data_cfg.get("kshot", None)
+        self.kshot = coerce_to_int(kshot_value, -1, key="data.kshot")
+
+        run_eda_value = get_config_value(self.data_cfg, "run_eda", False)
+        self.run_eda = bool(False if run_eda_value is None else run_eda_value)
+
+        class_dist_value = get_config_value(self.training_cfg, "class_distribution", False)
+        self.class_distribution_enabled = bool(False if class_dist_value is None else class_dist_value)
+        
+        interval_value = get_config_value(self.training_cfg, "log_interval", None)
+        if interval_value is None:
+            interval_value = get_config_value(self.logging_cfg, "epoch_log_interval", None)
+        self.epoch_log_interval = max(1, coerce_to_int(interval_value, 10, key="training.log_interval"))
+
+        base_output_value = self.logging_cfg.get("output_dir", self.DEFAULT_OUTPUT_DIR)
+        base_output = coerce_to_str(base_output_value, self.DEFAULT_OUTPUT_DIR, key="logging.output_dir")
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.run_dir = os.path.join(base_output, timestamp)
+        logger.info(f"Run directory: {self.run_dir}")
+        self.config_path = os.path.join(self.run_dir, 'config.json')
+        self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
+        self.best_model_path = os.path.join(self.run_dir, 'best.pt')
+        self.last_model_path = os.path.join(self.run_dir, 'last.pt')
+        self.eda_dir = os.path.join(self.run_dir, 'eda')
+
+        self.clip_mean = get_config_value(self.data_cfg, "clip_mean", [0.48145466, 0.4578275, 0.40821073])
+        self.clip_std = get_config_value(self.data_cfg, "clip_std", [0.26862954, 0.26130258, 0.27577711])
+
+        self.dataset = None
+        self.val_loader = None
+        self.classnames = []
+        self.train_indices = []
+        self.val_indices = []
+        self.labeled_indices = []
+        self.unlabeled_indices = []
+        self.metrics = []
+        self.best_val_acc = -float('inf')
+        self.global_epoch = 0
+
+        self.trainer = None
+        self.trainer_cfg = ConfigNode({})
+
+        self.checkpoint_cache = None
+        self.checkpoint_id = None
+        feature_cache_enabled = bool(self.feature_cache_cfg.get('enabled', True))
+        feature_cache_dir = self.feature_cache_cfg.get('cache_dir', CLIPFeatureCache.DEFAULT_CACHE_DIR)
+        self.clip_feature_cache = CLIPFeatureCache(feature_cache_dir, enabled=feature_cache_enabled)
+        self._init_checkpoint_cache()
+
+        base_novel_cfg = self.data_cfg.get('base_novel', ConfigNode())
+        self.base_novel_enabled = bool(base_novel_cfg.get('enabled', False))
+        self.base_novel_split_ratio = coerce_to_float(base_novel_cfg.get('split_ratio', 0.5), 0.5)
+        self.base_class_indices = []
+        self.novel_class_indices = []
+
+    def _get_training_epochs(self):
+        epochs_value = None
+        if isinstance(self.training_cfg, dict):
+            epochs_value = self.training_cfg.get('epochs', None)
+        return coerce_to_int(epochs_value, 100, key='training.epochs')
+
+    def _should_log_epoch(self, epoch_idx: int, epochs_total: int) -> bool:
+        return (epoch_idx % self.epoch_log_interval == 0) or (epoch_idx == epochs_total)
+
+    def _init_checkpoint_cache(self):
+        checkpoint_cfg = self.config.get('checkpoint', ConfigNode())
+        if bool(checkpoint_cfg.get('enabled', False)):
+            cache_dir = checkpoint_cfg.get('cache_dir', self.DEFAULT_CHECKPOINT_DIR)
+            self.checkpoint_cache = CheckpointCache(cache_dir)
+            self.checkpoint_id = self.checkpoint_cache.compute_checkpoint_id(self.config)
+            logger.info(f"Checkpoint cache enabled. ID: {self.checkpoint_id}")
+
+    def _try_load_checkpoint(self) -> bool:
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return False
+        if not self.checkpoint_cache.exists(self.checkpoint_id):
+            return False
+        ckpt = self.checkpoint_cache.load(self.checkpoint_id)
+        if ckpt is None:
+            return False
+        if self.trainer is None:
+            return False
+
+        model_state = ckpt['model_state_dict']
+        if 'ctx' in model_state:
+            self.trainer.model.prompt_learner.ctx.data = model_state['ctx']
+        else:
+            first_key = next(iter(model_state.keys()), '')
+            if first_key.startswith('0.'):
+                self.trainer.model.prompt_learner.load_state_dict(model_state)
+            else:
+                prompt_state = {k.replace('prompt_learner.', ''): v for k, v in model_state.items() if k.startswith('prompt_learner.')}
+                if prompt_state:
+                    self.trainer.model.prompt_learner.load_state_dict(prompt_state)
+                else:
+                    self.trainer.model.load_state_dict(model_state, strict=False)
+
+        self.trainer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        self.trainer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        self.labeled_indices = ckpt['labeled_indices']
+        self.unlabeled_indices = ckpt['unlabeled_indices']
+        self.metrics = ckpt['metrics']
+        self.global_epoch = len(self.metrics)
+        self.cached_apt_predictions = ckpt.get('apt_predictions', None)
+        logger.info(f"Loaded checkpoint: {self.checkpoint_id} (epoch {self.global_epoch})")
+        return True
+
+    def _save_checkpoint(self):
+        if self.checkpoint_cache is None or self.checkpoint_id is None:
+            return
+        if self.trainer is None:
+            return
+        
+        model_state = {}
+        if hasattr(self.trainer.model, 'prompt_learner') and hasattr(self.trainer.model.prompt_learner, 'ctx'):
+            model_state['ctx'] = self.trainer.model.prompt_learner.ctx.data
+        elif hasattr(self.trainer.model, 'prompt_learner'):
+            model_state = self.trainer.model.prompt_learner.state_dict()
+        elif hasattr(self.trainer.model, 'model_state_dict'):
+            model_state = self.trainer.model.model_state_dict()
+        else:
+            model_state = self.trainer.model.state_dict()
+
+        apt_predictions = None
+        if hasattr(self, '_compute_apt_predictions'):
+            apt_predictions = self._compute_apt_predictions()
+
+        path = self.checkpoint_cache.save(
+            self.checkpoint_id,
+            model_state,
+            self.trainer.optimizer.state_dict(),
+            self.trainer.scheduler.state_dict(),
+            self.labeled_indices,
+            self.unlabeled_indices,
+            self.metrics,
+            self.config,
+            apt_predictions=apt_predictions
+        )
+        logger.debug(f"Saved checkpoint to: {path}")
+
+    def run(self):
+        set_global_seed(self.seed)
+
+        logger.section("Initialization", "config")
+        self._prepare_directories()
+        self._load_dataset()
+        self._split_dataset()
+        self._initialize_trainer()
+
+        dataset_name = self.config.data.dataset_name
+        log_experiment_start(self.METHOD_NAME, dataset_name, self.kshot, self.seed)
+
+        logger.section(f"{self.METHOD_NAME} Training", "train")
+        self._train_epochs()
+
+        logger.section("Finalization", "save")
+        self._finalize()
+
+    def _prepare_directories(self):
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.eda_dir, exist_ok=True)
+
+    def _build_transforms(self):
+        base_transforms = [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=self.clip_mean, std=self.clip_std),
+        ]
+        return transforms.Compose(base_transforms)
+
+    def _clip_feature_transform_spec(self):
+        return {
+            "resize": 256,
+            "center_crop": 224,
+            "normalize_mean": list(self.clip_mean),
+            "normalize_std": list(self.clip_std),
+        }
+
+    def _apply_cached_text_features(self, payload):
+        if self.trainer is None:
+            return
+        text_features = payload["text_features"].to(self.device).float()
+        if hasattr(self.trainer, "text_features"):
+            self.trainer.text_features = text_features
+        if hasattr(self.trainer, "clip_weights"):
+            self.trainer.clip_weights = text_features.t().contiguous()
+        if hasattr(self.trainer, "text_prototypes"):
+            self.trainer.text_prototypes = text_features
+
+    def _load_clip_feature_payload(self, dataset, dataset_id):
+        if self.trainer is None:
+            raise RuntimeError("Trainer must be initialized before loading CLIP feature cache.")
+        if dataset is None:
+            raise RuntimeError(f"Cannot build CLIP feature cache for missing dataset: {dataset_id}")
+
+        backbone = coerce_to_str(self.model_cfg.get("backbone", "ViT-B/16"), "ViT-B/16", key="model.backbone")
+        precision = coerce_to_str(self.training_cfg.get("precision", "fp32"), "fp32", key="training.precision")
+        template = getattr(self.trainer, "template", "a photo of a {}.")
+        payload = self.clip_feature_cache.load_or_compute(
+            dataset=dataset,
+            dataset_id=dataset_id,
+            clip_model=getattr(self.trainer, "clip_model", getattr(self.trainer, "model", None)),
+            classnames=self.classnames,
+            template=template,
+            backbone=backbone,
+            precision=precision,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            device=self.device,
+            clip_mean=self.clip_mean,
+            clip_std=self.clip_std,
+            transform_spec=self._clip_feature_transform_spec(),
+        )
+        self._apply_cached_text_features(payload)
+        return payload
+
+    def _full_dataset_clip_features(self):
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be loaded before loading CLIP feature cache.")
+        if not hasattr(self, '_clip_feature_payload') or self._clip_feature_payload is None:
+            self._clip_feature_payload = self._load_clip_feature_payload(self.dataset, "train_or_full")
+        return self._clip_feature_payload
+
+    def _cached_train_features(self):
+        payload = self._full_dataset_clip_features()
+        from torch.utils.data import Subset
+        indices = torch.tensor(self.train_indices, dtype=torch.long)
+        return payload["image_features"][indices], payload["labels"][indices]
+
+    def _cached_val_features(self):
+        if self.val_fraction is not None:
+            payload = self._full_dataset_clip_features()
+            indices = torch.tensor(self.val_indices, dtype=torch.long)
+            return payload["image_features"][indices], payload["labels"][indices]
+        if not hasattr(self, '_clip_val_payload') or self._clip_val_payload is None:
+            self._clip_val_payload = self._load_clip_feature_payload(self._val_dataset, "val_or_test")
+        return self._clip_val_payload["image_features"], self._clip_val_payload["labels"]
+
+    def _cached_test_features(self):
+        if hasattr(self, '_val_dataset') and self._val_dataset is not None:
+            if not hasattr(self, '_clip_val_payload') or self._clip_val_payload is None:
+                self._clip_val_payload = self._load_clip_feature_payload(self._val_dataset, "val_or_test")
+            return self._clip_val_payload["image_features"], self._clip_val_payload["labels"]
+        return self._cached_val_features()
+
+    def _load_dataset(self):
+        transform = self._build_transforms()
+        from torch.utils.data import DataLoader, Subset
+        if self.val_fraction is not None:
+            try:
+                self.dataset = fast_image_folder(self.dataset_root, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
+            if self.run_eda:
+                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+        else:
+            train_path = os.path.join(self.dataset_root, 'train')
+            test_path = os.path.join(self.dataset_root, 'test')
+            try:
+                self.dataset = fast_image_folder(train_path, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
+            try:
+                self._val_dataset = fast_image_folder(test_path, transform=transform)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
+            if self.run_eda:
+                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+
+    def _split_dataset(self):
+        from torch.utils.data import Subset, DataLoader
+        from collections import defaultdict
+        import math
+        if self.dataset is None:
+            raise RuntimeError("Dataset must be loaded before splitting.")
+
+        dataset_name = self.config.data.dataset_name
+        cache_dir = ".cache/support_sets"
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{dataset_name}_shot{self.kshot}_seed{self.seed}.json")
+
+        loaded_from_cache = False
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache_data = json.load(f)
+                self.val_indices = cache_data["val_indices"]
+                self.train_indices = cache_data["train_indices"]
+                self.labeled_indices = cache_data["labeled_indices"]
+                self.unlabeled_indices = cache_data["unlabeled_indices"]
+                loaded_from_cache = True
+                logger.info(f"Loaded support set indices from cache: {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load support set cache from {cache_file}: {e}")
+
+        if not loaded_from_cache:
+            samples_by_class_idx = defaultdict(list)
+            for idx, (_, class_idx) in enumerate(self.dataset.samples):
+                samples_by_class_idx[class_idx].append(idx)
+
+            rng = random.Random(self.seed)
+            val_indices = []
+            train_indices = []
+            unlabeled_indices = []
+
+            if self.val_fraction is not None:
+                for class_idx in sorted(samples_by_class_idx.keys()):
+                    class_samples = list(samples_by_class_idx[class_idx])
+                    class_samples.sort()
+                    rng.shuffle(class_samples)
+
+                    val_count = int(math.floor(len(class_samples) * self.val_fraction))
+                    if self.val_fraction > 0 and val_count == 0 and len(class_samples) > 0:
+                        val_count = 1
+
+                    val_part = class_samples[:val_count]
+                    train_candidates = class_samples[val_count:]
+                    if self.kshot > 0:
+                        labeled_part = train_candidates[:self.kshot]
+                        leftover_part = train_candidates[self.kshot:]
+                    else:
+                        labeled_part = train_candidates
+                        leftover_part = []
+
+                    val_indices.extend(val_part)
+                    train_indices.extend(labeled_part)
+                    unlabeled_indices.extend(leftover_part)
+            else:
+                for class_idx in sorted(samples_by_class_idx.keys()):
+                    class_samples = list(samples_by_class_idx[class_idx])
+                    class_samples.sort()
+                    rng.shuffle(class_samples)
+
+                    if self.kshot > 0:
+                        labeled_part = class_samples[:self.kshot]
+                        leftover_part = class_samples[self.kshot:]
+                    else:
+                        labeled_part = class_samples
+                        leftover_part = []
+                    train_indices.extend(labeled_part)
+                    unlabeled_indices.extend(leftover_part)
+
+            self.val_indices = val_indices
+            self.train_indices = train_indices
+            self.labeled_indices = list(train_indices)
+            self.unlabeled_indices = unlabeled_indices
+
+            try:
+                cache_data = {
+                    "val_indices": self.val_indices,
+                    "train_indices": self.train_indices,
+                    "labeled_indices": self.labeled_indices,
+                    "unlabeled_indices": self.unlabeled_indices
+                }
+                with open(cache_file, "w") as f:
+                    json.dump(cache_data, f)
+                logger.info(f"Saved support set indices to cache: {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save support set cache to {cache_file}: {e}")
+
+        if self.val_fraction is not None:
+            if len(self.val_indices) > 0:
+                val_ds = Subset(self.dataset, self.val_indices)
+                self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+            else:
+                logger.warning("Validation split is empty; skipping validation metrics")
+        else:
+            self.val_loader = DataLoader(self._val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+        self.classnames = list(self.dataset.classes)
+
+        if self.base_novel_enabled:
+            num_classes = len(self.classnames)
+            num_base = int(num_classes * self.base_novel_split_ratio)
+            all_class_indices = list(range(num_classes))
+            rng.shuffle(all_class_indices)
+            self.base_class_indices = sorted(all_class_indices[:num_base])
+            self.novel_class_indices = sorted(all_class_indices[num_base:])
+            base_set = set(self.base_class_indices)
+            self.train_indices = [i for i in self.train_indices if self.dataset.samples[i][1] in base_set]
+            self.labeled_indices = list(self.train_indices)
+            logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base, {len(self.novel_class_indices)} novel classes")
+
+        if self.val_fraction is not None:
+            total_images = len(self.dataset)
+            val_count = len(self.val_indices)
+        else:
+            total_images = len(self.dataset) + len(self._val_dataset)
+            val_count = len(self._val_dataset)
+
+        stats = {
+            'total_images': total_images,
+            'val_count': val_count,
+            'train_count': len(self.train_indices),
+            'labeled_count': len(self.train_indices),
+            'unlabeled_count': len(self.unlabeled_indices),
+            'train_pool_size': len(self.train_indices) + len(self.unlabeled_indices)
+        }
+        logger.info(f"Dataset loaded: {stats['total_images']} total images")
+        val_percentage = (stats['val_count'] / stats['total_images'] * 100.0) if stats['total_images'] > 0 else 0.0
+        logger.info(f"Validation: {stats['val_count']} ({val_percentage:.2f}%), Train: {stats['train_count']}, Unlabeled: {stats['unlabeled_count']}")
+
+        trainer_cfg = self._build_trainer_config(stats, val_percentage)
+        with open(self.config_path, 'w') as f:
+            json.dump(trainer_cfg.to_dict(), f, indent=4)
+
+    def _build_trainer_config(self, stats, val_percentage):
+        extra_values = {
+            'dataset_root': self.dataset_root,
+            'val_size': self.val_fraction,
+            'classnames': self.classnames,
+            'num_classes': len(self.classnames),
+            'train_size': stats.get('labeled_count', stats['train_count']),
+            'val_size_count': stats['val_count'],
+            'train_pool_size': stats.get('train_pool_size', stats['train_count'] + stats.get('unlabeled_count', 0)),
+            'unlabeled_pool_size': stats.get('unlabeled_count', 0),
+            'val_percentage_actual': val_percentage,
+        }
+
+        trainer_cfg = build_config_namespace(self.config, extra_values)
+        self.trainer_cfg = trainer_cfg
+        return trainer_cfg
+
+    def _metrics_title(self, method_name=None):
+        method = method_name or self.METHOD_NAME
+        dataset = get_config_value(self.data_cfg, "dataset_name", "unknown-dataset")
+        return f"{method} x {dataset}"
+
+    def _initialize_trainer(self):
+        if not self.classnames:
+            raise RuntimeError("Class names unavailable before trainer initialization.")
+        if self.TRAINER_CLASS is None:
+            raise NotImplementedError("Subclass must set TRAINER_CLASS")
+        self.trainer = self.TRAINER_CLASS(self.trainer_cfg, self.classnames, device=str(self.device))
+
+    def _train_epochs(self):
+        from torch.utils.data import Subset, DataLoader
+        if self.dataset is None or self.trainer is None:
+            raise RuntimeError("Pipeline not initialized before training.")
+        if not self.train_indices:
+            raise RuntimeError("No training samples available.")
+
+        if self._try_load_checkpoint():
+            logger.info("Skipping training (loaded from checkpoint)")
+            return
+
+        train_subset = Subset(self.dataset, list(self.train_indices))
+        train_loader = DataLoader(train_subset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+        epochs_total = self._get_training_epochs()
+
+        for epoch_idx in range(1, epochs_total + 1):
+            self._run_epoch(epoch_idx, epochs_total, train_loader, self.run_dir)
+
+        self._save_checkpoint()
+
+    def _run_epoch(self, epoch_idx, epochs_total, train_loader, run_dir):
+        from torch.utils.data import DataLoader
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized before epoch run.")
+        self.global_epoch += 1
+        start_time = time.time()
+        self.trainer.model.train()
+        running_loss = 0.0
+        running_accuracy = 0.0
+        steps = 0
+
+        for batch in train_loader:
+            loss_dict = self.trainer.train_step(batch)
+            running_loss += loss_dict['loss']
+            running_accuracy += loss_dict['accuracy']
+            steps += 1
+
+        avg_loss = running_loss / max(1, steps)
+        avg_acc = running_accuracy / max(1, steps)
+
+        if self.val_loader is not None:
+            results = self.trainer.evaluate(self.val_loader)
+            val_acc = results['accuracy']
+            val_loss = results['loss']
+            all_preds = results['predictions']
+            all_labels = results['true_labels']
+        else:
+            val_acc = 0.0
+            val_loss = 0.0
+            all_preds = []
+            all_labels = []
+
+        epoch_dir = os.path.join(run_dir, f'epoch_{epoch_idx:03d}')
+        os.makedirs(epoch_dir, exist_ok=True)
+
+        if bool(get_config_value(self.training_cfg, 'confusion_matrix', False)) and all_labels:
+            save_confusion_artifacts(all_labels, all_preds, self.global_epoch, epoch_dir)
+
+        if self.class_distribution_enabled and all_labels:
+            save_class_distribution_plot(
+                all_labels,
+                all_preds,
+                self.global_epoch,
+                epoch_dir,
+                self.classnames,
+            )
+
+        epoch_time = time.time() - start_time
+
+        base_val_acc = None
+        novel_val_acc = None
+        harmonic_mean = None
+        if self.base_novel_enabled and all_labels:
+            base_set = set(self.base_class_indices)
+            novel_set = set(self.novel_class_indices)
+            base_correct = sum(1 for p, l in zip(all_preds, all_labels) if l in base_set and p == l)
+            base_total = sum(1 for l in all_labels if l in base_set)
+            novel_correct = sum(1 for p, l in zip(all_preds, all_labels) if l in novel_set and p == l)
+            novel_total = sum(1 for l in all_labels if l in novel_set)
+            if base_total > 0:
+                base_val_acc = 100 * base_correct / base_total
+            if novel_total > 0:
+                novel_val_acc = 100 * novel_correct / novel_total
+            if base_val_acc is not None and novel_val_acc is not None and (base_val_acc + novel_val_acc) > 0:
+                harmonic_mean = 2 * base_val_acc * novel_val_acc / (base_val_acc + novel_val_acc)
+
+        epoch_result = {
+            'epoch': epoch_idx,
+            'train_loss': avg_loss,
+            'train_acc': avg_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'base_val_acc': base_val_acc,
+            'novel_val_acc': novel_val_acc,
+            'harmonic_mean': harmonic_mean,
+            'time': epoch_time,
+            'accuracy': results.get('accuracy', val_acc) if self.val_loader else 0.0,
+            'mca': results.get('mca', 0.0) if self.val_loader else 0.0,
+            'f1_macro': results.get('f1_macro', 0.0) if self.val_loader else 0.0,
+            'f1_micro': results.get('f1_micro', 0.0) if self.val_loader else 0.0,
+            'f1_weighted': results.get('f1_weighted', 0.0) if self.val_loader else 0.0,
+            'precision_macro': results.get('precision_macro', 0.0) if self.val_loader else 0.0,
+            'precision_micro': results.get('precision_micro', 0.0) if self.val_loader else 0.0,
+            'precision_weighted': results.get('precision_weighted', 0.0) if self.val_loader else 0.0,
+            'recall_macro': results.get('recall_macro', 0.0) if self.val_loader else 0.0,
+            'recall_micro': results.get('recall_micro', 0.0) if self.val_loader else 0.0,
+            'recall_weighted': results.get('recall_weighted', 0.0) if self.val_loader else 0.0,
+        }
+        with open(os.path.join(epoch_dir, 'result.json'), 'w') as f:
+            json.dump(epoch_result, f, indent=2)
+
+        self.metrics.append(epoch_result)
+
+        if self.save_best_last and self.val_loader is not None and val_acc > self.best_val_acc:
+            self.best_val_acc = val_acc
+            self.trainer.save_model(self.best_model_path)
+
+        if self.base_novel_enabled and base_val_acc is not None:
+            logger.info(f"{self.METHOD_NAME} Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc:.2f}% - base={base_val_acc:.2f}% - novel={novel_val_acc:.2f}% - H={harmonic_mean:.2f}% - {epoch_time:.2f}s")
+        else:
+            val_acc_display = f"{val_acc:.2f}%" if self.val_loader is not None else "N/A"
+            logger.info(f"{self.METHOD_NAME} Epoch {epoch_idx} - loss={avg_loss:.4f} - acc={avg_acc:.2f}% - val_acc={val_acc_display} - {epoch_time:.2f}s")
+
+        if self.trainer.scheduler is not None:
+            self.trainer.scheduler.step()
+
+    def _finalize(self):
+        if self.trainer is None:
+            raise RuntimeError("Trainer not initialized before finalization.")
+
+        with open(self.config_path, 'w') as f:
+            json.dump(self.trainer_cfg.to_dict(), f, indent=4)
+
+        with open(self.metrics_path, 'w') as f:
+            json.dump(self.metrics, f, indent=4)
+
+        if self.save_best_last:
+            self.trainer.save_model(self.last_model_path)
+
+        logger.info(f"Training completed. Results written to {self.run_dir}")
+
+        final_metrics = self.metrics[-1] if self.metrics else {}
+        log_experiment_metrics(final_metrics)
