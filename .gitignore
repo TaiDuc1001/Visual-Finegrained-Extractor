@@ -17,9 +17,11 @@ outputs
 to_delete
 *.pt
 *.json
-uv.lock
 
 checkpoints
 
 *.sh
 # *.log
+kaggle_upload/
+
+.syk4y-temp/
