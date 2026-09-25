@@ -1758,15 +1758,7 @@ class BaseTrainingPipeline:
         workers_value = self.data_cfg.get("num_workers", None)
         self.num_workers = coerce_to_int(workers_value, 4, key="data.num_workers")
 
-        val_value = self.data_cfg.get("val_size", None)
-        if val_value is not None:
-            self.val_fraction = coerce_to_float(val_value, 0.7, key="data.val_size")
-            if self.val_fraction > 1.0:
-                self.val_fraction = self.val_fraction / 100.0
-            if self.val_fraction < 0 or self.val_fraction >= 1.0:
-                raise ValueError("data.val_size must be in [0, 1) or 0-100 range when expressed as percentage.")
-        else:
-            self.val_fraction = None
+        self.val_fraction = None
 
         dataset_root_value = self.data_cfg.get("root", "./datasets/cub-200-2011-renamed")
         self.dataset_root = coerce_to_str(dataset_root_value, "./datasets/cub-200-2011-renamed", key="data.root")
@@ -2005,10 +1997,6 @@ class BaseTrainingPipeline:
         return payload["image_features"][indices], payload["labels"][indices]
 
     def _cached_val_features(self):
-        if self.val_fraction is not None:
-            payload = self._full_dataset_clip_features()
-            indices = torch.tensor(self.val_indices, dtype=torch.long)
-            return payload["image_features"][indices], payload["labels"][indices]
         if not hasattr(self, '_clip_val_payload') or self._clip_val_payload is None:
             self._clip_val_payload = self._load_clip_feature_payload(self._val_dataset, "val_or_test")
         return self._clip_val_payload["image_features"], self._clip_val_payload["labels"]
@@ -2022,27 +2010,18 @@ class BaseTrainingPipeline:
 
     def _load_dataset(self):
         transform = self._build_transforms()
-        from torch.utils.data import DataLoader, Subset
-        if self.val_fraction is not None:
-            try:
-                self.dataset = fast_image_folder(self.dataset_root, transform=transform)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load dataset from {self.dataset_root}: {exc}")
-            if self.run_eda:
-                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
-        else:
-            train_path = os.path.join(self.dataset_root, 'train')
-            test_path = os.path.join(self.dataset_root, 'test')
-            try:
-                self.dataset = fast_image_folder(train_path, transform=transform)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
-            try:
-                self._val_dataset = fast_image_folder(test_path, transform=transform)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
-            if self.run_eda:
-                run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
+        train_path = os.path.join(self.dataset_root, 'train')
+        test_path = os.path.join(self.dataset_root, 'test')
+        try:
+            self.dataset = fast_image_folder(train_path, transform=transform)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load train dataset from {train_path}: {exc}")
+        try:
+            self._val_dataset = fast_image_folder(test_path, transform=transform)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load test dataset from {test_path}: {exc}")
+        if self.run_eda:
+            run_dataset_eda(self.dataset, self.eda_dir, sample_limit=512, seed=self.seed)
 
     def _split_dataset(self):
         from torch.utils.data import Subset, DataLoader
@@ -2061,7 +2040,6 @@ class BaseTrainingPipeline:
             try:
                 with open(cache_file, "r") as f:
                     cache_data = json.load(f)
-                self.val_indices = cache_data["val_indices"]
                 self.train_indices = cache_data["train_indices"]
                 self.labeled_indices = cache_data["labeled_indices"]
                 self.unlabeled_indices = cache_data["unlabeled_indices"]
@@ -2076,55 +2054,29 @@ class BaseTrainingPipeline:
                 samples_by_class_idx[class_idx].append(idx)
 
             rng = random.Random(self.seed)
-            val_indices = []
             train_indices = []
             unlabeled_indices = []
 
-            if self.val_fraction is not None:
-                for class_idx in sorted(samples_by_class_idx.keys()):
-                    class_samples = list(samples_by_class_idx[class_idx])
-                    class_samples.sort()
-                    rng.shuffle(class_samples)
+            for class_idx in sorted(samples_by_class_idx.keys()):
+                class_samples = list(samples_by_class_idx[class_idx])
+                class_samples.sort()
+                rng.shuffle(class_samples)
 
-                    val_count = int(math.floor(len(class_samples) * self.val_fraction))
-                    if self.val_fraction > 0 and val_count == 0 and len(class_samples) > 0:
-                        val_count = 1
+                if self.kshot > 0:
+                    labeled_part = class_samples[:self.kshot]
+                    leftover_part = class_samples[self.kshot:]
+                else:
+                    labeled_part = class_samples
+                    leftover_part = []
+                train_indices.extend(labeled_part)
+                unlabeled_indices.extend(leftover_part)
 
-                    val_part = class_samples[:val_count]
-                    train_candidates = class_samples[val_count:]
-                    if self.kshot > 0:
-                        labeled_part = train_candidates[:self.kshot]
-                        leftover_part = train_candidates[self.kshot:]
-                    else:
-                        labeled_part = train_candidates
-                        leftover_part = []
-
-                    val_indices.extend(val_part)
-                    train_indices.extend(labeled_part)
-                    unlabeled_indices.extend(leftover_part)
-            else:
-                for class_idx in sorted(samples_by_class_idx.keys()):
-                    class_samples = list(samples_by_class_idx[class_idx])
-                    class_samples.sort()
-                    rng.shuffle(class_samples)
-
-                    if self.kshot > 0:
-                        labeled_part = class_samples[:self.kshot]
-                        leftover_part = class_samples[self.kshot:]
-                    else:
-                        labeled_part = class_samples
-                        leftover_part = []
-                    train_indices.extend(labeled_part)
-                    unlabeled_indices.extend(leftover_part)
-
-            self.val_indices = val_indices
             self.train_indices = train_indices
             self.labeled_indices = list(train_indices)
             self.unlabeled_indices = unlabeled_indices
 
             try:
                 cache_data = {
-                    "val_indices": self.val_indices,
                     "train_indices": self.train_indices,
                     "labeled_indices": self.labeled_indices,
                     "unlabeled_indices": self.unlabeled_indices
@@ -2135,14 +2087,8 @@ class BaseTrainingPipeline:
             except Exception as e:
                 logger.warning(f"Failed to save support set cache to {cache_file}: {e}")
 
-        if self.val_fraction is not None:
-            if len(self.val_indices) > 0:
-                val_ds = Subset(self.dataset, self.val_indices)
-                self.val_loader = DataLoader(val_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-            else:
-                logger.warning("Validation split is empty; skipping validation metrics")
-        else:
-            self.val_loader = DataLoader(self._val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        self.val_indices = list(range(len(self._val_dataset)))
+        self.val_loader = DataLoader(self._val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
 
         self.classnames = list(self.dataset.classes)
 
@@ -2150,6 +2096,7 @@ class BaseTrainingPipeline:
             num_classes = len(self.classnames)
             num_base = int(num_classes * self.base_novel_split_ratio)
             all_class_indices = list(range(num_classes))
+            rng = random.Random(self.seed)
             rng.shuffle(all_class_indices)
             self.base_class_indices = sorted(all_class_indices[:num_base])
             self.novel_class_indices = sorted(all_class_indices[num_base:])
@@ -2158,12 +2105,8 @@ class BaseTrainingPipeline:
             self.labeled_indices = list(self.train_indices)
             logger.info(f"Base-to-Novel: {len(self.base_class_indices)} base, {len(self.novel_class_indices)} novel classes")
 
-        if self.val_fraction is not None:
-            total_images = len(self.dataset)
-            val_count = len(self.val_indices)
-        else:
-            total_images = len(self.dataset) + len(self._val_dataset)
-            val_count = len(self._val_dataset)
+        total_images = len(self.dataset) + len(self._val_dataset)
+        val_count = len(self._val_dataset)
 
         stats = {
             'total_images': total_images,
@@ -2184,7 +2127,7 @@ class BaseTrainingPipeline:
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
             'dataset_root': self.dataset_root,
-            'val_size': self.val_fraction,
+            'val_size': None,
             'classnames': self.classnames,
             'num_classes': len(self.classnames),
             'train_size': stats.get('labeled_count', stats['train_count']),

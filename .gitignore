@@ -23,3 +23,8 @@ kaggle_upload/
 
 .syk4y-temp/
 .agents
+
+!src/datasets
+datasets
+!src/models
+models

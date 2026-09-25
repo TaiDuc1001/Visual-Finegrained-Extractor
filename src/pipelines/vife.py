@@ -250,6 +250,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
         return {
             'logits': torch.cat(all_logits, dim=0),
             'labels': torch.cat(all_labels, dim=0),
+            'val_indices': list(self.val_indices) if hasattr(self, 'val_indices') else [],
         }
 
     def _save_checkpoint(self):
@@ -1001,10 +1002,15 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
             self.ssl_classifier.eval()
 
         if self.cached_apt_predictions is not None:
-            all_apt_logits = self.cached_apt_predictions['logits']
-            all_labels = self.cached_apt_predictions['labels']
-            logger.debug("Using cached APT predictions")
-        else:
+            cached_indices = self.cached_apt_predictions.get('val_indices')
+            if cached_indices is not None and list(cached_indices) == list(self.val_indices):
+                all_apt_logits = self.cached_apt_predictions['logits']
+                all_labels = self.cached_apt_predictions['labels']
+                logger.debug("Using cached APT predictions")
+            else:
+                self.cached_apt_predictions = None
+
+        if self.cached_apt_predictions is None:
             all_apt_logits = []
             all_labels_list = []
             with torch.no_grad():
@@ -1017,7 +1023,11 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
                     all_labels_list.append(labels)
             all_apt_logits = torch.cat(all_apt_logits, dim=0)
             all_labels = torch.cat(all_labels_list, dim=0)
-            self.cached_apt_predictions = {'logits': all_apt_logits, 'labels': all_labels}
+            self.cached_apt_predictions = {
+                'logits': all_apt_logits,
+                'labels': all_labels,
+                'val_indices': list(self.val_indices) if hasattr(self, 'val_indices') else [],
+            }
             self._save_checkpoint()
             logger.debug("Computed and saved APT predictions to checkpoint")
 
@@ -1090,7 +1100,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
                 true_label_i = all_labels[i].item()
                 
                 val_idx = self.val_indices[i]
-                img_path, _ = self.dataset.samples[val_idx]
+                img_path, _ = self._val_dataset.samples[val_idx]
                 apt_name = self.classnames[apt_pred_i]
                 img_name = self.classnames[img_pred_i]
                 
@@ -1299,7 +1309,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
         return metrics
 
     def _refresh_sample_cache(self, all_labels):
-        if self.dataset is None:
+        if self._val_dataset is None:
             return
         if self.val_loader is None or len(self.val_indices) == 0:
             return
@@ -1308,7 +1318,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
         selected_indices = []
         seen_classes = set()
         for idx in self.val_indices:
-            cls_idx = self.dataset.samples[idx][1]
+            cls_idx = self._val_dataset.samples[idx][1]
             if cls_idx not in seen_classes:
                 seen_classes.add(cls_idx)
                 selected_indices.append(idx)
@@ -1322,7 +1332,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
                     self.sample_cache['images'] = batch_data[0]
                     self.sample_cache['labels'] = batch_data[1]
                     batch_indices = self.val_indices[:len(batch_data[0])]
-                    self.sample_cache['paths'] = [os.path.abspath(self.dataset.samples[idx][0]) for idx in batch_indices]
+                    self.sample_cache['paths'] = [os.path.abspath(self._val_dataset.samples[idx][0]) for idx in batch_indices]
                 else:
                     self.sample_cache['images'] = batch_data
                     self.sample_cache['labels'] = None
@@ -1336,10 +1346,10 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
             sample_labels_list = []
             sample_paths = []
             for idx in selected_indices:
-                img, lbl = self.dataset[idx]
+                img, lbl = self._val_dataset[idx]
                 sample_images_list.append(img)
                 sample_labels_list.append(lbl)
-                sample_paths.append(os.path.abspath(self.dataset.samples[idx][0]))
+                sample_paths.append(os.path.abspath(self._val_dataset.samples[idx][0]))
 
             self.sample_cache['images'] = torch.stack(sample_images_list)
             self.sample_cache['labels'] = torch.tensor(sample_labels_list)
@@ -1350,7 +1360,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
             return
         visualize_attention_maps(
             self.trainer,
-            self.dataset,
+            self._val_dataset,
             self.sample_cache,
             self.classnames,
             self.global_epoch,
@@ -1362,7 +1372,7 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
             return
         visualize_gradcam_maps(
             self.trainer,
-            self.dataset,
+            self._val_dataset,
             self.sample_cache,
             self.classnames,
             self.global_epoch,
