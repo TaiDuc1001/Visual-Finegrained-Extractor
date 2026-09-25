@@ -452,8 +452,55 @@ def parse_override_arguments(tokens):
 
 
 def load_clip_to_cpu(backbone_name):
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, root='./models')
+    if os.path.isfile(backbone_name):
+        model_path = backbone_name
+    elif backbone_name in clip._MODELS:
+        url = clip._MODELS[backbone_name]
+        filename = os.path.basename(url)
+
+        candidates = []
+        if os.path.isfile('./models'):
+            candidates.append('./models')
+        if os.path.isdir('./models'):
+            candidates.append(os.path.join('./models', filename))
+            candidates.append(os.path.join('./models', 'ViT-B-16.pt'))
+
+        cache_dir = os.path.expanduser("~/.cache/clip")
+        candidates.append(os.path.join(cache_dir, filename))
+        candidates.append(os.path.join(cache_dir, 'ViT-B-16.pt'))
+
+        model_path = None
+        for cand in candidates:
+            if os.path.isfile(cand):
+                try:
+                    _ = torch.jit.load(cand, map_location="cpu")
+                    model_path = cand
+                    logger.info(f"Using pre-existing CLIP model from: {model_path}")
+                    break
+                except Exception:
+                    try:
+                        _ = torch.load(cand, map_location="cpu")
+                        model_path = cand
+                        logger.info(f"Using pre-existing CLIP model from: {model_path}")
+                        break
+                    except Exception:
+                        pass
+
+        if model_path is None:
+            if os.path.exists('./models') and os.path.isdir('./models'):
+                target_root = './models'
+            elif not os.path.exists('./models'):
+                try:
+                    os.makedirs('./models', exist_ok=True)
+                    target_root = './models'
+                except OSError:
+                    target_root = cache_dir
+            else:
+                target_root = cache_dir
+            os.makedirs(target_root, exist_ok=True)
+            model_path = clip._download(url, root=target_root)
+    else:
+        raise ValueError(f"Backbone {backbone_name} not found in CLIP models.")
 
     try:
         model = torch.jit.load(model_path, map_location="cpu").eval()
@@ -1122,9 +1169,12 @@ def compute_metrics(true_labels: Sequence[int], predictions: Sequence[int]) -> D
     return metrics
 
 
-def log_experiment_metrics(metrics: Dict[str, float]) -> None:
+def log_experiment_metrics(metrics: Dict[str, float], title: Optional[str] = None) -> None:
     logger.info(f"{'='*40}")
-    logger.info("Evaluation Results:")
+    if title:
+        logger.info(f"Evaluation Results ({title}):")
+    else:
+        logger.info("Evaluation Results:")
     logger.info(f"  Accuracy: {metrics.get('accuracy', 0.0):.2f}%")
     if 'time' in metrics:
         logger.info(f"  Time:     {metrics.get('time', 0.0):.1f}s")
