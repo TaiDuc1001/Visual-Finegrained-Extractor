@@ -1832,8 +1832,12 @@ class BaseTrainingPipeline:
 
         base_output_value = self.logging_cfg.get("output_dir", self.DEFAULT_OUTPUT_DIR)
         base_output = coerce_to_str(base_output_value, self.DEFAULT_OUTPUT_DIR, key="logging.output_dir")
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.run_dir = os.path.join(base_output, timestamp)
+        use_timestamp = bool(get_config_value(self.logging_cfg, "use_timestamp", True))
+        if use_timestamp:
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.run_dir = os.path.join(base_output, timestamp)
+        else:
+            self.run_dir = base_output
         logger.info(f"Run directory: {self.run_dir}")
         self.config_path = os.path.join(self.run_dir, 'config.json')
         self.metrics_path = os.path.join(self.run_dir, 'metrics.json')
@@ -2171,8 +2175,9 @@ class BaseTrainingPipeline:
         logger.info(f"Validation: {stats['val_count']} ({val_percentage:.2f}%), Train: {stats['train_count']}, Unlabeled: {stats['unlabeled_count']}")
 
         trainer_cfg = self._build_trainer_config(stats, val_percentage)
-        with open(self.config_path, 'w') as f:
-            json.dump(trainer_cfg.to_dict(), f, indent=4)
+        if self.config_path:
+            with open(self.config_path, 'w') as f:
+                json.dump(trainer_cfg.to_dict(), f, indent=4)
 
     def _build_trainer_config(self, stats, val_percentage):
         extra_values = {
@@ -2334,13 +2339,15 @@ class BaseTrainingPipeline:
         if self.trainer is None:
             raise RuntimeError("Trainer not initialized before finalization.")
 
-        with open(self.config_path, 'w') as f:
-            json.dump(self.trainer_cfg.to_dict(), f, indent=4)
+        if self.config_path:
+            with open(self.config_path, 'w') as f:
+                json.dump(self.trainer_cfg.to_dict(), f, indent=4)
 
-        with open(self.metrics_path, 'w') as f:
-            json.dump(self.metrics, f, indent=4)
+        if self.metrics_path:
+            with open(self.metrics_path, 'w') as f:
+                json.dump(self.metrics, f, indent=4)
 
-        if self.save_best_last:
+        if self.save_best_last and self.last_model_path:
             self.trainer.save_model(self.last_model_path)
 
         logger.info(f"Training completed. Results written to {self.run_dir}")

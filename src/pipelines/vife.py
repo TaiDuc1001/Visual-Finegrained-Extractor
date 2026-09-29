@@ -487,14 +487,15 @@ class VIFETrainingPipeline(BaseTrainingPipeline):
         logger.debug(f"SSL Stage 1 config: trans_layers={num_trans_layers}, heads={num_heads}, eval_freq={eval_freq}")
         logger.debug(f"Multi-crop config: global={global_crop_size}, local={local_crop_size}, num_local={num_local_crops}")
 
-        self.ssl_student = ImageSSLModel(
-            copy.deepcopy(self.trainer.model.vis_encoder),
-            feature_dim,
-            proj_dim,
-            num_prototypes,
-            num_trans_layers=num_trans_layers,
-            num_heads=num_heads
-        ).to(self.device)
+        if self.ssl_student is None:
+            self.ssl_student = ImageSSLModel(
+                copy.deepcopy(self.trainer.model.vis_encoder),
+                feature_dim,
+                proj_dim,
+                num_prototypes,
+                num_trans_layers=num_trans_layers,
+                num_heads=num_heads
+            ).to(self.device)
 
         self.ssl_teacher = create_teacher_from_student(self.ssl_student)
         self.ssl_center = torch.zeros(num_prototypes, device=self.device)
